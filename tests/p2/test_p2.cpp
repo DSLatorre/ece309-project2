@@ -7,9 +7,21 @@
 // This file is a stub so the project builds out of the box; replace the
 // body of main() with your own tests.
 
+#include <cstddef>
+#include <string>
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
+#define private public
 #include "core/conversation.h"
-#include "core/message.h"
 #include "core/sentinel_scanner.h"
+#undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
+
 #include "harness/harness.h"
 #include "model/replay_client.h"
 #include "model/scripted_client.h"
@@ -18,7 +30,6 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
-#include <string>
 #include <stdexcept>
 #include <utility>
 
@@ -59,6 +70,12 @@ class OneLineInput : public InputSource {
 public:
     std::string read_line() override { return "hello"; }
     bool is_eof() const override { return false; }
+};
+
+class EofInput : public InputSource {
+public:
+    std::string read_line() override { return ""; }
+    bool is_eof() const override { return true; }
 };
 
 class CollectingOutput : public OutputSink {
@@ -108,9 +125,19 @@ int main() {
         growing.append(Message(Role::User, "message " + std::to_string(i)));
     }
     assert(growing.size() == 20);
+    assert(growing.capacity_ == 32);
     for (std::size_t i = 0; i < growing.size(); ++i) {
         assert(growing.at(i).content() == "message " + std::to_string(i));
     }
+
+    Conversation capacity_check;
+    assert(capacity_check.capacity_ == 0);
+    capacity_check.append(Message(Role::User, "0"));
+    assert(capacity_check.capacity_ == 1);
+    capacity_check.append(Message(Role::User, "1"));
+    assert(capacity_check.capacity_ == 2);
+    capacity_check.append(Message(Role::User, "2"));
+    assert(capacity_check.capacity_ == 4);
 
     Conversation original;
     original.append(Message(Role::System, "system message"));
@@ -190,7 +217,7 @@ int main() {
            "Hello <|end_world|>");
 
     std::string adversarial;
-    for (int i = 0; i < 10000; ++i) {
+    for (int i = 0; i < 250000; ++i) {
         adversarial += "<|end_conversatioX";
     }
     SentinelScanner bounded_scanner("<|end_conversation|>");
@@ -201,12 +228,23 @@ int main() {
             std::string_view(adversarial.data() + i, 1));
         reconstructed += result.safe_text;
         adversarial_found = adversarial_found || result.sentinel_found;
+        assert(bounded_scanner.pending_.size() <=
+               bounded_scanner.sentinel_.size() - 1);
     }
     auto adversarial_tail = bounded_scanner.flush();
     reconstructed += adversarial_tail.safe_text;
     adversarial_found = adversarial_found || adversarial_tail.sentinel_found;
     assert(!adversarial_found);
     assert(reconstructed == adversarial);
+
+    SentinelScanner pending_bound_scanner("<|end_conversation|>");
+    for (std::size_t i = 0; i < pending_bound_scanner.sentinel_.size(); ++i) {
+        pending_bound_scanner.feed(
+            std::string_view(pending_bound_scanner.sentinel_.data() + i, 1));
+        assert(pending_bound_scanner.pending_.size() <=
+               pending_bound_scanner.sentinel_.size() - 1);
+    }
+
     HarnessConfig turn_limit_config;
     turn_limit_config.max_turns = 1;
     Harness harness(std::make_unique<FixedModelClient>(), turn_limit_config);
@@ -214,6 +252,12 @@ int main() {
     CollectingOutput output;
     StopReason turn_limit = harness.run(input, output);
     assert(turn_limit.kind == StopReason::Kind::TurnLimit);
+
+    Harness eof_harness(std::make_unique<FixedModelClient>(), HarnessConfig{});
+    EofInput eof_input;
+    CollectingOutput eof_output;
+    StopReason eof_stop = eof_harness.run(eof_input, eof_output);
+    assert(eof_stop.kind == StopReason::Kind::UserExit);
 
     Harness sentinel_harness(
         std::make_unique<SplitSentinelModelClient>(), HarnessConfig{});
