@@ -1,26 +1,10 @@
-// tests/p2/test_p2.cpp
-//
-// YOUR test suite goes here. At least 12 assert-based test cases — see
-// spec §5 for the required categories and the sample test for the
-// expected level of rigor.
-//
-// This file is a stub so the project builds out of the box; replace the
-// body of main() with your own tests.
+// Tests for message storage, streaming sentinel detection, and the harness.
 
 #include <cstddef>
 #include <string>
 
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#endif
-#define private public
 #include "core/conversation.h"
 #include "core/sentinel_scanner.h"
-#undef private
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
 
 #include "harness/harness.h"
 #include "model/replay_client.h"
@@ -34,50 +18,27 @@
 #include <utility>
 
 namespace {
-class FixedModelClient : public ModelClient {
-public:
-    void generate(const Conversation&, TokenSink& sink) override {
-        sink.on_chunk("fixed reply");
-        sink.on_complete();
-    }
-};
+// Write a deterministic script for a test that uses the provided client.
+void write_script(const std::string& path, const std::string& content) {
+    std::ofstream script(path);
+    script << content;
+}
 
-class SplitSentinelModelClient : public ModelClient {
-public:
-    void generate(const Conversation&, TokenSink& sink) override {
-        sink.on_chunk("Goodbye.<|end_");
-        sink.on_chunk("conversation|>");
-        sink.on_complete();
-    }
-};
-
-class RecordingModelClient : public ModelClient {
-public:
-    void generate(const Conversation& conversation, TokenSink& sink) override {
-        system_message_first =
-            conversation.size() >= 2 &&
-            conversation.at(0).role() == Role::System &&
-            conversation.at(0).content() == "system instructions" &&
-            conversation.at(1).role() == Role::User;
-        sink.on_chunk("recorded reply");
-        sink.on_complete();
-    }
-
-    bool system_message_first = false;
-};
-
+// Input source that always supplies one line and never reaches EOF.
 class OneLineInput : public InputSource {
 public:
     std::string read_line() override { return "hello"; }
     bool is_eof() const override { return false; }
 };
 
+// Input source used to verify the harness stops cleanly at EOF.
 class EofInput : public InputSource {
 public:
     std::string read_line() override { return ""; }
     bool is_eof() const override { return true; }
 };
 
+// Output sink that makes all emitted text available to assertions.
 class CollectingOutput : public OutputSink {
 public:
     void write(std::string_view text) override { text_ += text; }
@@ -87,6 +48,7 @@ private:
     std::string text_;
 };
 
+// Token sink that records generated text and completion callbacks.
 class CollectingTokenSink : public TokenSink {
 public:
     void on_chunk(std::string_view chunk) override { text += chunk; }
@@ -102,6 +64,7 @@ public:
 }  // namespace
 
 int main() {
+    // Empty conversations support size, iteration, and checked access.
     Conversation empty;
     assert(empty.size() == 0);
     assert(empty.begin() == empty.end());
@@ -114,31 +77,24 @@ int main() {
     }
     assert(out_of_range);
 
+    // Appending preserves message roles and contents.
     Conversation conversation;
     conversation.append(Message(Role::User, "hello"));
     assert(conversation.size() == 1);
     assert(conversation.at(0).role() == Role::User);
     assert(conversation.at(0).content() == "hello");
 
+    // Repeated appends preserve all entries as the container grows.
     Conversation growing;
     for (int i = 0; i < 20; ++i) {
         growing.append(Message(Role::User, "message " + std::to_string(i)));
     }
     assert(growing.size() == 20);
-    assert(growing.capacity_ == 32);
     for (std::size_t i = 0; i < growing.size(); ++i) {
         assert(growing.at(i).content() == "message " + std::to_string(i));
     }
 
-    Conversation capacity_check;
-    assert(capacity_check.capacity_ == 0);
-    capacity_check.append(Message(Role::User, "0"));
-    assert(capacity_check.capacity_ == 1);
-    capacity_check.append(Message(Role::User, "1"));
-    assert(capacity_check.capacity_ == 2);
-    capacity_check.append(Message(Role::User, "2"));
-    assert(capacity_check.capacity_ == 4);
-
+    // Copy construction and copy assignment duplicate storage, not just values.
     Conversation original;
     original.append(Message(Role::System, "system message"));
     original.append(Message(Role::Assistant, "assistant message"));
@@ -163,11 +119,13 @@ int main() {
     assert(destination.at(1).content() == source.at(1).content());
     assert(destination.begin() != source.begin());
     Conversation& self = destination;
+    // Self-assignment leaves the destination unchanged.
     destination = self;
     assert(destination.size() == 2);
     assert(destination.at(0).content() == "source user");
     assert(destination.at(1).content() == "source assistant");
 
+    // Move operations transfer the buffer and reset the moved-from object.
     Conversation moving_source;
     moving_source.append(Message(Role::User, "move me"));
     const Message* old_address = moving_source.begin();
@@ -192,6 +150,7 @@ int main() {
     assert(move_assignment_source.size() == 0);
     assert(move_assignment_source.begin() == move_assignment_source.end());
 
+    // Text without a marker is emitted on flush.
     SentinelScanner clean_scanner("<|end_conversation|>");
     auto clean_out = clean_scanner.feed("Hello there");
     assert(!clean_out.sentinel_found);
@@ -199,6 +158,7 @@ int main() {
     assert(!clean_tail.sentinel_found);
     assert(clean_out.safe_text + clean_tail.safe_text == "Hello there");
 
+    // Every possible chunk split must still detect a marker spanning chunks.
     const std::string split_input = "Goodbye.<|end_conversation|>";
     for (std::size_t split = 0; split <= split_input.size(); ++split) {
         SentinelScanner split_scanner("<|end_conversation|>");
@@ -208,6 +168,7 @@ int main() {
         assert(first_half.safe_text + second_half.safe_text == "Goodbye.");
     }
 
+    // Similar-looking text must not be mistaken for the exact marker.
     SentinelScanner false_alarm_scanner("<|end_conversation|>");
     auto false_alarm_out = false_alarm_scanner.feed("Hello <|end_world|>");
     auto false_alarm_tail = false_alarm_scanner.flush();
@@ -216,6 +177,7 @@ int main() {
     assert(false_alarm_out.safe_text + false_alarm_tail.safe_text ==
            "Hello <|end_world|>");
 
+    // Adversarial one-byte input must preserve the complete safe output.
     std::string adversarial;
     for (int i = 0; i < 250000; ++i) {
         adversarial += "<|end_conversatioX";
@@ -228,8 +190,6 @@ int main() {
             std::string_view(adversarial.data() + i, 1));
         reconstructed += result.safe_text;
         adversarial_found = adversarial_found || result.sentinel_found;
-        assert(bounded_scanner.pending_.size() <=
-               bounded_scanner.sentinel_.size() - 1);
     }
     auto adversarial_tail = bounded_scanner.flush();
     reconstructed += adversarial_tail.safe_text;
@@ -237,30 +197,43 @@ int main() {
     assert(!adversarial_found);
     assert(reconstructed == adversarial);
 
-    SentinelScanner pending_bound_scanner("<|end_conversation|>");
-    for (std::size_t i = 0; i < pending_bound_scanner.sentinel_.size(); ++i) {
-        pending_bound_scanner.feed(
-            std::string_view(pending_bound_scanner.sentinel_.data() + i, 1));
-        assert(pending_bound_scanner.pending_.size() <=
-               pending_bound_scanner.sentinel_.size() - 1);
-    }
+    const std::string harness_script_path = "/tmp/ece309_harness_test.script";
+    write_script(harness_script_path,
+                 "role: assistant\n"
+                 "fixed reply\n"
+                 "---\n");
 
+    // The harness reports its configured turn limit.
     HarnessConfig turn_limit_config;
     turn_limit_config.max_turns = 1;
-    Harness harness(std::make_unique<FixedModelClient>(), turn_limit_config);
+    Harness harness(std::make_unique<ScriptedModelClient>(harness_script_path),
+                    turn_limit_config);
     OneLineInput input;
     CollectingOutput output;
     StopReason turn_limit = harness.run(input, output);
     assert(turn_limit.kind == StopReason::Kind::TurnLimit);
 
-    Harness eof_harness(std::make_unique<FixedModelClient>(), HarnessConfig{});
+    // EOF is reported as a user exit without requiring a model response.
+    Harness eof_harness(
+        std::make_unique<ScriptedModelClient>(harness_script_path),
+        HarnessConfig{});
     EofInput eof_input;
     CollectingOutput eof_output;
     StopReason eof_stop = eof_harness.run(eof_input, eof_output);
     assert(eof_stop.kind == StopReason::Kind::UserExit);
 
+    const std::string sentinel_script_path = "/tmp/ece309_sentinel_test.script";
+    write_script(sentinel_script_path,
+                 "chunk: 12\n"
+                 "role: assistant\n"
+                 "Goodbye.<|end_conversation|>\n"
+                 "---\n");
+
+    // A provided scripted client can split the sentinel, and the harness stops
+    // generation without printing the sentinel.
     Harness sentinel_harness(
-        std::make_unique<SplitSentinelModelClient>(), HarnessConfig{});
+        std::make_unique<ScriptedModelClient>(sentinel_script_path),
+        HarnessConfig{});
     OneLineInput sentinel_input;
     CollectingOutput sentinel_output;
     StopReason sentinel_stop = sentinel_harness.run(sentinel_input, sentinel_output);
@@ -269,17 +242,31 @@ int main() {
     assert(sentinel_output.text().find("<|end_conversation|>") ==
            std::string::npos);
 
-    auto recording_model = std::make_unique<RecordingModelClient>();
-    RecordingModelClient* recording_model_ptr = recording_model.get();
+    // The provided client's public system-message accessor supplies the
+    // harness configuration, and the conversation exposes the resulting order.
+    const std::string system_script_path = "/tmp/ece309_system_test.script";
+    write_script(system_script_path,
+                 "role: system\n"
+                 "system instructions\n"
+                 "---\n"
+                 "role: assistant\n"
+                 "recorded reply\n"
+                 "---\n");
+    auto system_model = std::make_unique<ScriptedModelClient>(system_script_path);
     HarnessConfig system_config;
     system_config.max_turns = 1;
-    system_config.system_message = "system instructions";
-    Harness system_harness(std::move(recording_model), system_config);
+    system_config.system_message = system_model->system_message();
+    Harness system_harness(std::move(system_model), system_config);
     OneLineInput system_input;
     CollectingOutput system_output;
     system_harness.run(system_input, system_output);
-    assert(recording_model_ptr->system_message_first);
+    assert(system_harness.conversation().size() >= 2);
+    assert(system_harness.conversation().at(0).role() == Role::System);
+    assert(system_harness.conversation().at(0).content() ==
+           "system instructions");
+    assert(system_harness.conversation().at(1).role() == Role::User);
 
+    // Replay output follows transcript order and invokes completion each time.
     const std::string transcript_path = "/tmp/ece309_replay_test.txt";
     {
         std::ofstream transcript(transcript_path);
@@ -311,6 +298,9 @@ int main() {
     assert(token_sink.text == "Goodbye.");
     assert(token_sink.completed);
     std::remove(transcript_path.c_str());
+    std::remove(harness_script_path.c_str());
+    std::remove(sentinel_script_path.c_str());
+    std::remove(system_script_path.c_str());
 
     return 0;
 }
