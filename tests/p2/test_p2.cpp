@@ -3,8 +3,17 @@
 #include <cstddef>
 #include <string>
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#endif
+#define private public
 #include "core/conversation.h"
 #include "core/sentinel_scanner.h"
+#undef private
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include "harness/harness.h"
 #include "model/replay_client.h"
@@ -86,8 +95,13 @@ int main() {
 
     // Repeated appends preserve all entries as the container grows.
     Conversation growing;
+    std::size_t expected_capacity = 0;
     for (int i = 0; i < 20; ++i) {
         growing.append(Message(Role::User, "message " + std::to_string(i)));
+        if (growing.size() > expected_capacity) {
+            expected_capacity = expected_capacity == 0 ? 1 : expected_capacity * 2;
+        }
+        assert(growing.capacity_ == expected_capacity);
     }
     assert(growing.size() == 20);
     for (std::size_t i = 0; i < growing.size(); ++i) {
@@ -188,6 +202,8 @@ int main() {
     for (std::size_t i = 0; i < adversarial.size(); ++i) {
         auto result = bounded_scanner.feed(
             std::string_view(adversarial.data() + i, 1));
+        assert(bounded_scanner.pending_.size() <=
+               bounded_scanner.sentinel_.size() - 1);
         reconstructed += result.safe_text;
         adversarial_found = adversarial_found || result.sentinel_found;
     }
